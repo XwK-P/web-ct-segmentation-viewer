@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Niivue } from '@niivue/niivue';
-import { FolderOpen, Layers, Monitor, Box, Settings, X, CheckSquare } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Niivue, DRAG_MODE } from '@niivue/niivue';
+import { FolderOpen, Layers, Monitor, Box, Settings, X, CheckSquare, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 
 type LabelData = {
   name: string;
@@ -28,6 +28,15 @@ export default function App() {
   const [showCrosshair, setShowCrosshair] = useState(true);
   const [bgColor, setBgColor] = useState('black');
   const [renderMode, setRenderMode] = useState<'matte' | 'shiny' | 'mip'>('matte');
+  const [isRadiologicalConvention, setIsRadiologicalConvention] = useState(true);
+  const [sagittalNoseLeft, setSagittalNoseLeft] = useState(true);
+
+  // Current slice type for view-aware mouse config
+  const [sliceType, setSliceType] = useState(3); // default multiplanar
+
+  // Window/Level live values
+  const [windowMin, setWindowMin] = useState(0);
+  const [windowMax, setWindowMax] = useState(0);
 
   // Initialize Niivue
   useEffect(() => {
@@ -38,8 +47,11 @@ export default function App() {
       show3Dcrosshair: true,
       isNearestInterpolation: true,
       multiplanarForceRender: true,
+      isRadiologicalConvention: true,
+      sagittalNoseLeft: true,
+      multiplanarLayout: 2,
     });
-    
+
     // Add custom colormaps for segmentations to ensure consistency with UI
     const customColormaps = {
       yellow: { R: [0, 255], G: [0, 255], B: [0, 0], A: [0, 255], I: [0, 255] },
@@ -47,7 +59,7 @@ export default function App() {
       magenta: { R: [0, 255], G: [0, 0], B: [0, 255], A: [0, 255], I: [0, 255] },
       orange: { R: [0, 255], G: [0, 165], B: [0, 0], A: [0, 255], I: [0, 255] },
     };
-    
+
     Object.entries(customColormaps).forEach(([name, cmap]) => {
       if (niivue.addColormap) {
         niivue.addColormap(name, cmap);
@@ -55,18 +67,90 @@ export default function App() {
     });
 
     niivue.attachToCanvas(canvasRef.current);
+
+    // Sync W/L display when user drags to change intensity
+    niivue.onIntensityChange = (volume) => {
+      if (volume && volume.name === '_base_') {
+        setWindowMin(Math.round(volume.cal_min ?? 0));
+        setWindowMax(Math.round(volume.cal_max ?? 0));
+      }
+    };
+
+    // Sync slice type state when changed via Niivue internals
+    niivue.onSliceTypeChange = (newSliceType: number) => {
+      setSliceType(newSliceType);
+    };
+
     setNv(niivue);
-    
+
     return () => {
       // Cleanup if needed
     };
   }, []);
 
+  // View-aware mouse config: 2D gets crosshair, 3D gets default rotation
+  useEffect(() => {
+    if (!nv) return;
+    if (sliceType === 4) {
+      // 3D view: reset to Niivue defaults (left-drag rotates)
+      nv.opts.mouseEventConfig = undefined;
+    } else {
+      // 2D views: left-click=crosshair, shift+drag=pan, right-drag=W/L
+      nv.setMouseEventConfig({
+        leftButton: { primary: DRAG_MODE.crosshair, withShift: DRAG_MODE.pan },
+        rightButton: DRAG_MODE.contrast,
+        centerButton: DRAG_MODE.pan,
+      });
+    }
+  }, [nv, sliceType]);
+
+  // Ctrl+scroll zoom for 2D views only (not 3D)
+  useEffect(() => {
+    if (!nv) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    if (sliceType === 4) return; // 3D view uses native scroll zoom
+
+    const handleWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      nv.volScaleMultiplier = Math.min(Math.max(nv.volScaleMultiplier * factor, 0.2), 10);
+      nv.drawScene();
+    };
+
+    canvas.addEventListener('wheel', handleWheel, { passive: false, capture: true });
+    return () => {
+      canvas.removeEventListener('wheel', handleWheel, { capture: true });
+    };
+  }, [nv, sliceType]);
+
+  // Zoom helpers
+  const zoomIn = useCallback(() => {
+    if (!nv) return;
+    nv.volScaleMultiplier = Math.min(nv.volScaleMultiplier * 1.2, 10);
+    nv.drawScene();
+  }, [nv]);
+
+  const zoomOut = useCallback(() => {
+    if (!nv) return;
+    nv.volScaleMultiplier = Math.max(nv.volScaleMultiplier / 1.2, 0.2);
+    nv.drawScene();
+  }, [nv]);
+
+  const zoomReset = useCallback(() => {
+    if (!nv) return;
+    nv.volScaleMultiplier = 1;
+    nv.drawScene();
+  }, [nv]);
+
   const handleImagesFolder = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
     const files = Array.from(e.target.files) as File[];
     const validFiles = files.filter(f => f.name.endsWith('.nii.gz') || f.name.endsWith('.nii'));
-    
+
     setCases(prev => {
       const newCases = { ...prev };
       validFiles.forEach(file => {
@@ -85,7 +169,7 @@ export default function App() {
     if (!e.target.files) return;
     const files = Array.from(e.target.files) as File[];
     const validFiles = files.filter(f => f.name.endsWith('.nii.gz') || f.name.endsWith('.nii'));
-    
+
     setCases(prev => {
       const newCases = { ...prev };
       validFiles.forEach(file => {
@@ -94,13 +178,13 @@ export default function App() {
         const matchingCaseId = Object.keys(newCases)
           .sort((a, b) => b.length - a.length)
           .find(id => file.name.startsWith(id + '_'));
-        
+
         if (matchingCaseId) {
           const labelName = file.name
             .substring(matchingCaseId.length + 1)
             .replace(/\.nii\.gz$/, '')
             .replace(/\.nii$/, '');
-            
+
           // Check if label already exists
           const existingLabelIndex = newCases[matchingCaseId].labelFiles.findIndex(l => l.name === labelName);
           if (existingLabelIndex >= 0) {
@@ -122,7 +206,7 @@ export default function App() {
           }
         }
       });
-      
+
       // Sort label files alphabetically
       Object.values(newCases).forEach((c: CaseData) => {
         c.labelFiles.sort((a, b) => a.name.localeCompare(b.name));
@@ -139,7 +223,7 @@ export default function App() {
 
     setSelectedCaseId(caseId);
     setActiveLabels([]); // Default to visualize none
-    
+
     // Clear existing volumes
     while (nv.volumes.length > 0) {
       nv.removeVolume(nv.volumes[0]);
@@ -154,16 +238,25 @@ export default function App() {
       if (caseData.imageFile) {
         await nv.loadFromFile(caseData.imageFile);
         if (nv.volumes.length > 0) {
-          nv.volumes[0].name = '_base_';
+          const vol = nv.volumes[0];
+          vol.name = '_base_';
+          // Ensure cal_min/cal_max are set for proper 3D rendering
+          if (vol.robust_min !== undefined && vol.robust_max !== undefined
+            && vol.robust_min !== vol.robust_max) {
+            vol.cal_min = vol.robust_min;
+            vol.cal_max = vol.robust_max;
+          }
+          setWindowMin(Math.round(vol.cal_min ?? 0));
+          setWindowMax(Math.round(vol.cal_max ?? 0));
         }
       }
-      
+
       // Apply current render mode
       let gradientAmount = 0;
       if (renderMode === 'shiny') gradientAmount = 1;
       else if (renderMode === 'mip') gradientAmount = NaN;
       nv.setVolumeRenderIllumination(gradientAmount);
-      
+
       nv.updateGLVolume();
     } catch (error) {
       console.error("Error loading files:", error);
@@ -175,7 +268,7 @@ export default function App() {
     if (!nv || !selectedCaseId) return;
     const caseData = cases[selectedCaseId];
     setIsLoadingLabels(true);
-    
+
     if (isChecked) {
       setActiveLabels(prev => [...prev, labelName]);
       const labelData = caseData.labelFiles.find(l => l.name === labelName);
@@ -207,7 +300,7 @@ export default function App() {
     setIsLoadingLabels(true);
     const caseData = cases[selectedCaseId];
     const labelsToAdd = caseData.labelFiles.filter(l => !activeLabels.includes(l.name));
-    
+
     const newActive = [...activeLabels];
     for (const label of labelsToAdd) {
       await nv.loadFromFile(label.file);
@@ -273,7 +366,7 @@ export default function App() {
       let gradientAmount = 0;
       if (mode === 'shiny') gradientAmount = 1;
       else if (mode === 'mip') gradientAmount = NaN;
-      
+
       nv.setVolumeRenderIllumination(gradientAmount);
       nv.updateGLVolume();
     }
@@ -283,6 +376,8 @@ export default function App() {
     if (!nv || nv.volumes.length === 0) return;
     nv.volumes[0].cal_min = min;
     nv.volumes[0].cal_max = max;
+    setWindowMin(min);
+    setWindowMax(max);
     nv.updateGLVolume();
   };
 
@@ -339,25 +434,24 @@ export default function App() {
                 return b.id.localeCompare(a.id);
               })
               .map(c => (
-              <button
-                key={c.id}
-                onClick={() => loadCase(c.id)}
-                className={`w-full text-left px-3 py-2 rounded-md text-sm transition-colors ${
-                  selectedCaseId === c.id 
-                    ? 'bg-indigo-500/20 text-indigo-300' 
+                <button
+                  key={c.id}
+                  onClick={() => loadCase(c.id)}
+                  className={`w-full text-left px-3 py-2 rounded-md text-sm transition-colors ${selectedCaseId === c.id
+                    ? 'bg-indigo-500/20 text-indigo-300'
                     : 'hover:bg-zinc-800 text-zinc-400'
-                }`}
-              >
-                <div className="font-medium truncate">{c.id}</div>
-                <div className="text-xs opacity-60 flex items-center gap-2 mt-1">
-                  <span className={c.imageFile ? 'text-emerald-400' : 'text-red-400'}>
-                    {c.imageFile ? 'CT' : 'No CT'}
-                  </span>
-                  <span>•</span>
-                  <span>{c.labelFiles.length} labels</span>
-                </div>
-              </button>
-            ))}
+                    }`}
+                >
+                  <div className="font-medium truncate">{c.id}</div>
+                  <div className="text-xs opacity-60 flex items-center gap-2 mt-1">
+                    <span className={c.imageFile ? 'text-emerald-400' : 'text-red-400'}>
+                      {c.imageFile ? 'CT' : 'No CT'}
+                    </span>
+                    <span>•</span>
+                    <span>{c.labelFiles.length} labels</span>
+                  </div>
+                </button>
+              ))}
             {Object.keys(cases).length === 0 && (
               <div className="px-3 py-4 text-sm text-zinc-600 text-center">
                 Select folders to load cases
@@ -370,67 +464,147 @@ export default function App() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Toolbar */}
-        <div className="h-14 bg-zinc-900 border-b border-zinc-800 flex items-center px-4 justify-between">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-zinc-400 mr-2">W/L Presets:</span>
-            <button onClick={() => setWindowLevel(-1000, 1000)} className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors">Lung</button>
-            <button onClick={() => setWindowLevel(-150, 250)} className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors">Soft Tissue</button>
-            <button onClick={() => setWindowLevel(300, 1500)} className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors">Bone</button>
-            <button onClick={() => setWindowLevel(0, 80)} className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors">Brain</button>
+        <div className="bg-zinc-900 border-b border-zinc-800 px-4 py-2 space-y-2">
+          {/* Row 1: Tools, Views, Settings */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1">
+              {/* Zoom controls */}
+              <div className="flex items-center gap-0.5">
+                <button
+                  onClick={zoomOut}
+                  className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
+                  title="Zoom out"
+                >
+                  <ZoomOut className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={zoomReset}
+                  className="px-2 py-1 text-xs text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
+                  title="Reset zoom"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={zoomIn}
+                  className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
+                  title="Zoom in"
+                >
+                  <ZoomIn className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => { nv?.setSliceType(0); setSliceType(0); }}
+                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
+              >
+                Axial
+              </button>
+              <button
+                onClick={() => { nv?.setSliceType(1); setSliceType(1); }}
+                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
+              >
+                Coronal
+              </button>
+              <button
+                onClick={() => { nv?.setSliceType(2); setSliceType(2); }}
+                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
+              >
+                Sagittal
+              </button>
+              <button
+                onClick={() => { nv?.setSliceType(3); setSliceType(3); }}
+                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
+              >
+                Multiplanar
+              </button>
+              <button
+                onClick={() => { nv?.setSliceType(4); setSliceType(4); }}
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 rounded-md transition-colors border border-indigo-500/20"
+              >
+                <Box className="w-4 h-4" />
+                3D Render
+              </button>
+              <div className="w-px h-6 bg-zinc-800 mx-1"></div>
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
+              >
+                <Settings className="w-4 h-4" />
+                Settings
+              </button>
+            </div>
           </div>
-          
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={() => nv?.setSliceType(0)}
-              className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
-            >
-              Axial
-            </button>
-            <button 
-              onClick={() => nv?.setSliceType(1)}
-              className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
-            >
-              Coronal
-            </button>
-            <button 
-              onClick={() => nv?.setSliceType(2)}
-              className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
-            >
-              Sagittal
-            </button>
-            <button 
-              onClick={() => nv?.setSliceType(3)}
-              className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
-            >
-              Multiplanar
-            </button>
-            <button 
-              onClick={() => nv?.setSliceType(4)}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 rounded-md transition-colors border border-indigo-500/20"
-            >
-              <Box className="w-4 h-4" />
-              3D Render
-            </button>
-            <div className="w-px h-6 bg-zinc-800 mx-1"></div>
-            <button 
-              onClick={() => setIsSettingsOpen(true)}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded-md transition-colors"
-            >
-              <Settings className="w-4 h-4" />
-              Settings
-            </button>
-          </div>
+
+          {/* Row 2: Window/Level controls */}
+          {selectedCaseId && (
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-zinc-500">W/L:</span>
+                <button onClick={() => setWindowLevel(-1000, 1000)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Lung</button>
+                <button onClick={() => setWindowLevel(-150, 250)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Soft Tissue</button>
+                <button onClick={() => setWindowLevel(100, 500)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Bone</button>
+                <button onClick={() => setWindowLevel(0, 80)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Brain</button>
+              </div>
+
+              <div className="w-px h-5 bg-zinc-800"></div>
+
+              {/* Manual W/L inputs */}
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1.5">
+                  <span className="text-xs text-zinc-500">Min</span>
+                  <input
+                    type="number"
+                    value={windowMin}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value) || 0;
+                      setWindowMin(val);
+                      setWindowLevel(val, windowMax);
+                    }}
+                    className="w-20 bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500 tabular-nums"
+                  />
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-xs text-zinc-500">Max</span>
+                  <input
+                    type="number"
+                    value={windowMax}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value) || 0;
+                      setWindowMax(val);
+                      setWindowLevel(windowMin, val);
+                    }}
+                    className="w-20 bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500 tabular-nums"
+                  />
+                </label>
+                <button
+                  onClick={() => {
+                    if (!nv || nv.volumes.length === 0) return;
+                    const vol = nv.volumes[0];
+                    if (vol.robust_min !== undefined && vol.robust_max !== undefined) {
+                      setWindowLevel(Math.round(vol.robust_min), Math.round(vol.robust_max));
+                    }
+                  }}
+                  className="px-2 py-1 text-xs text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
+                  title="Reset to auto range"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="flex-1"></div>
+
+              <span className="text-xs text-zinc-600">
+                Click: crosshair · Right-drag: W/L · Shift+drag: pan · Ctrl+scroll: zoom · Scroll: slice
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Viewport */}
         <div className="flex-1 relative bg-black">
           <canvas ref={canvasRef} className="absolute inset-0 w-full h-full outline-none" />
-          
-          {selectedCaseId && (
-            <div className="absolute bottom-4 left-4 pointer-events-none text-xs text-zinc-500 bg-black/50 px-2 py-1 rounded">
-              Right-click and drag to adjust Window/Level manually
-            </div>
-          )}
 
           {!selectedCaseId && (
             <div className="absolute inset-0 flex items-center justify-center bg-zinc-950 z-10">
@@ -444,7 +618,7 @@ export default function App() {
                     Select your CT images and segmentation labels folders from the sidebar to begin viewing.
                   </p>
                 </div>
-                
+
                 {Object.keys(cases).length === 0 ? (
                   <div className="flex items-center gap-2 text-xs font-medium text-indigo-400 bg-indigo-500/10 px-3 py-1.5 rounded-full border border-indigo-500/20 mt-2">
                     <FolderOpen className="w-3.5 h-3.5" />
@@ -461,7 +635,7 @@ export default function App() {
           )}
         </div>
       </div>
-      
+
       {/* Right Sidebar - Labels */}
       {selectedCaseId && cases[selectedCaseId]?.labelFiles.length > 0 && (
         <div className="w-64 bg-zinc-900 border-l border-zinc-800 flex flex-col">
@@ -471,14 +645,14 @@ export default function App() {
               {isLoadingLabels && <span className="text-xs text-indigo-400 animate-pulse">Loading...</span>}
             </h2>
             <div className="flex gap-2 mt-3">
-              <button 
+              <button
                 onClick={showAllLabels}
                 disabled={isLoadingLabels}
                 className="flex-1 px-2 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors disabled:opacity-50"
               >
                 Show All
               </button>
-              <button 
+              <button
                 onClick={hideAllLabels}
                 disabled={isLoadingLabels}
                 className="flex-1 px-2 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors disabled:opacity-50"
@@ -492,16 +666,15 @@ export default function App() {
               const colormaps = ['red', 'green', 'blue', 'yellow', 'cyan', 'magenta', 'orange'];
               const color = colormaps[idx % colormaps.length];
               const isActive = activeLabels.includes(label.name);
-              
+
               return (
-                <label 
-                  key={label.name} 
-                  className={`flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer transition-colors ${
-                    isActive ? 'bg-zinc-800' : 'hover:bg-zinc-800/50'
-                  } ${isLoadingLabels ? 'opacity-50 pointer-events-none' : ''}`}
+                <label
+                  key={label.name}
+                  className={`flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer transition-colors ${isActive ? 'bg-zinc-800' : 'hover:bg-zinc-800/50'
+                    } ${isLoadingLabels ? 'opacity-50 pointer-events-none' : ''}`}
                 >
-                  <input 
-                    type="checkbox" 
+                  <input
+                    type="checkbox"
                     className="hidden"
                     checked={isActive}
                     onChange={(e) => toggleLabel(label.name, e.target.checked)}
@@ -532,12 +705,51 @@ export default function App() {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            
+
             <div className="p-6 space-y-6">
+              {/* Axial/Coronal Convention */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-300">Axial/Coronal Convention</label>
+                <select
+                  value={isRadiologicalConvention ? 'radiological' : 'neurological'}
+                  onChange={(e) => {
+                    const val = e.target.value === 'radiological';
+                    setIsRadiologicalConvention(val);
+                    if (nv) {
+                      nv.setRadiologicalConvention(val);
+                    }
+                  }}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="radiological">Radiological (patient left → screen right)</option>
+                  <option value="neurological">Neurological (patient left → screen left)</option>
+                </select>
+              </div>
+
+              {/* Sagittal Orientation */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-300">Sagittal Orientation</label>
+                <select
+                  value={sagittalNoseLeft ? 'left' : 'right'}
+                  onChange={(e) => {
+                    const val = e.target.value === 'left';
+                    setSagittalNoseLeft(val);
+                    if (nv) {
+                      nv.opts.sagittalNoseLeft = val;
+                      nv.updateGLVolume();
+                    }
+                  }}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="left">Nose Left</option>
+                  <option value="right">Nose Right</option>
+                </select>
+              </div>
+
               {/* Case Sorting */}
               <div className="space-y-2">
                 <label className="text-sm font-medium text-zinc-300">Case Sorting</label>
-                <select 
+                <select
                   value={sortOrder}
                   onChange={(e) => setSortOrder(e.target.value as 'asc' | 'desc')}
                   className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500"
@@ -553,10 +765,10 @@ export default function App() {
                   <label className="text-sm font-medium text-zinc-300">Label Opacity</label>
                   <span className="text-xs text-zinc-500">{Math.round(labelOpacity * 100)}%</span>
                 </div>
-                <input 
-                  type="range" 
-                  min="0.1" 
-                  max="1" 
+                <input
+                  type="range"
+                  min="0.1"
+                  max="1"
                   step="0.05"
                   value={labelOpacity}
                   onChange={handleOpacityChange}
@@ -567,7 +779,7 @@ export default function App() {
               {/* Background Color */}
               <div className="space-y-2">
                 <label className="text-sm font-medium text-zinc-300">Background Color</label>
-                <select 
+                <select
                   value={bgColor}
                   onChange={handleBgColorChange}
                   className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500"
@@ -581,7 +793,7 @@ export default function App() {
               {/* 3D Render Mode */}
               <div className="space-y-2">
                 <label className="text-sm font-medium text-zinc-300">3D Render Mode</label>
-                <select 
+                <select
                   value={renderMode}
                   onChange={(e) => handleRenderModeChange(e.target.value as any)}
                   className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500"
@@ -596,8 +808,8 @@ export default function App() {
               <div className="flex items-center justify-between pt-2">
                 <label className="text-sm font-medium text-zinc-300">Show 3D Crosshair</label>
                 <label className="relative inline-flex items-center cursor-pointer">
-                  <input 
-                    type="checkbox" 
+                  <input
+                    type="checkbox"
                     className="sr-only peer"
                     checked={showCrosshair}
                     onChange={handleCrosshairToggle}
@@ -606,9 +818,9 @@ export default function App() {
                 </label>
               </div>
             </div>
-            
+
             <div className="p-4 border-t border-zinc-800 bg-zinc-900/50 flex justify-end">
-              <button 
+              <button
                 onClick={() => setIsSettingsOpen(false)}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors"
               >
