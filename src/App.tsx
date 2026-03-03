@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Niivue, DRAG_MODE } from '@niivue/niivue';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Niivue, DRAG_MODE, NVImage } from '@niivue/niivue';
 import {
   FolderOpen, Layers, Monitor, Box, Settings, X, CheckSquare, ZoomIn, ZoomOut, RotateCcw,
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
@@ -41,6 +41,89 @@ const DATATYPE_NAMES: Record<number, string> = {
   256: 'int8', 512: 'uint16', 768: 'uint32',
 };
 
+type LabelRowProps = {
+  label: LabelData;
+  isActive: boolean;
+  isSoloed: boolean;
+  isLoadingLabels: boolean;
+  displayColor: string;
+  defaultHex: string;
+  currentColor: string;
+  opacity: number;
+  onToggle: (name: string, checked: boolean) => void;
+  onColorChange: (name: string, hex: string) => void;
+  onToggleSolo: (name: string) => void;
+  onOpacityChange: (name: string, val: number) => void;
+};
+
+const LabelRow = React.memo(function LabelRow({
+  label, isActive, isSoloed, isLoadingLabels, displayColor, defaultHex,
+  currentColor, opacity, onToggle, onColorChange, onToggleSolo, onOpacityChange,
+}: LabelRowProps) {
+  return (
+    <div className={`rounded-md transition-colors ${isActive ? 'bg-zinc-800' : 'hover:bg-zinc-800/50'} ${isLoadingLabels ? 'opacity-50 pointer-events-none' : ''}`}>
+      <div className="flex items-center gap-2 px-3 py-2">
+        {/* Checkbox */}
+        <label className="cursor-pointer shrink-0">
+          <input
+            type="checkbox"
+            className="hidden"
+            checked={isActive}
+            onChange={(e) => onToggle(label.name, e.target.checked)}
+          />
+          <div className={`w-4 h-4 rounded flex items-center justify-center border ${isActive ? 'border-transparent' : 'border-zinc-600'}`} style={{ backgroundColor: isActive ? displayColor : 'transparent' }}>
+            {isActive && <CheckSquare className="w-3 h-3 text-white" />}
+          </div>
+        </label>
+
+        {/* Color picker (shows as swatch, click opens native picker) */}
+        <div className="relative shrink-0">
+          <input
+            type="color"
+            value={currentColor || defaultHex}
+            onChange={(e) => onColorChange(label.name, e.target.value)}
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+            title="Change color"
+          />
+          <div className="w-3.5 h-3.5 rounded-sm border border-zinc-600" style={{ backgroundColor: displayColor }}></div>
+        </div>
+
+        {/* Label name */}
+        <span className={`text-xs font-medium truncate flex-1 ${isActive ? 'text-zinc-200' : 'text-zinc-500'}`} title={label.name}>
+          {label.name}
+        </span>
+
+        {/* Solo button (only when active) */}
+        {isActive && (
+          <button
+            onClick={() => onToggleSolo(label.name)}
+            className={`p-0.5 rounded transition-colors shrink-0 ${isSoloed ? 'text-indigo-300' : 'text-zinc-500 hover:text-zinc-300'}`}
+            title={isSoloed ? 'Show all' : 'Solo this label'}
+          >
+            {isSoloed ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+          </button>
+        )}
+      </div>
+
+      {/* Per-label opacity slider (only when active) */}
+      {isActive && (
+        <div className="flex items-center gap-2 px-3 pb-2">
+          <input
+            type="range"
+            min="0.05" max="1" step="0.05"
+            value={opacity}
+            onChange={(e) => onOpacityChange(label.name, parseFloat(e.target.value))}
+            className="flex-1 accent-indigo-500 h-1"
+          />
+          <span className="text-[10px] text-zinc-500 w-7 text-right tabular-nums">
+            {Math.round(opacity * 100)}%
+          </span>
+        </div>
+      )}
+    </div>
+  );
+});
+
 export default function App() {
   const [cases, setCases] = useState<Record<string, CaseData>>({});
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
@@ -48,8 +131,9 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Customization State
-  const [activeLabels, setActiveLabels] = useState<string[]>([]);
+  const [activeLabels, setActiveLabels] = useState<Set<string>>(new Set());
   const [isLoadingLabels, setIsLoadingLabels] = useState(false);
+  const [loadProgress, setLoadProgress] = useState<{ loaded: number; total: number } | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   const [labelOpacity, setLabelOpacity] = useState(0.5);
@@ -98,6 +182,19 @@ export default function App() {
   const getLabelOpacity = useCallback((name: string) => {
     return labelOpacities[name] ?? labelOpacity;
   }, [labelOpacities, labelOpacity]);
+
+  // RAF-debounced GPU update for slider interactions
+  const updateGLVolumeTimerRef = useRef<number | null>(null);
+  const debouncedUpdateGLVolume = useCallback(() => {
+    if (!nv) return;
+    if (updateGLVolumeTimerRef.current !== null) {
+      cancelAnimationFrame(updateGLVolumeTimerRef.current);
+    }
+    updateGLVolumeTimerRef.current = requestAnimationFrame(() => {
+      nv.updateGLVolume();
+      updateGLVolumeTimerRef.current = null;
+    });
+  }, [nv]);
 
   // Initialize Niivue
   useEffect(() => {
@@ -306,7 +403,7 @@ export default function App() {
     if (!caseData) return;
 
     setSelectedCaseId(caseId);
-    setActiveLabels([]); // Default to visualize none
+    setActiveLabels(new Set()); // Default to visualize none
 
     // Reset per-case state
     setLabelSearchQuery('');
@@ -368,13 +465,13 @@ export default function App() {
     }
   };
 
-  const toggleLabel = async (labelName: string, isChecked: boolean) => {
+  const toggleLabel = useCallback(async (labelName: string, isChecked: boolean) => {
     if (!nv || !selectedCaseId) return;
     const caseData = cases[selectedCaseId];
     setIsLoadingLabels(true);
 
     if (isChecked) {
-      setActiveLabels(prev => [...prev, labelName]);
+      setActiveLabels(prev => new Set([...prev, labelName]));
       const labelData = caseData.labelFiles.find(l => l.name === labelName);
       if (labelData) {
         await nv.loadFromFile(labelData.file);
@@ -390,7 +487,7 @@ export default function App() {
         nv.updateGLVolume();
       }
     } else {
-      setActiveLabels(prev => prev.filter(n => n !== labelName));
+      setActiveLabels(prev => { const next = new Set(prev); next.delete(labelName); return next; });
       if (soloLabel === labelName) setSoloLabel(null);
       const volToRemove = nv.volumes.find(v => v.name === labelName);
       if (volToRemove) {
@@ -399,43 +496,69 @@ export default function App() {
       }
     }
     setIsLoadingLabels(false);
-  };
+  }, [nv, selectedCaseId, cases, soloLabel, getLabelOpacity]);
 
-  const showAllLabels = async () => {
+  const showAllLabels = useCallback(async () => {
     if (!nv || !selectedCaseId) return;
     setIsLoadingLabels(true);
     const caseData = cases[selectedCaseId];
-    const labelsToAdd = caseData.labelFiles.filter(l => !activeLabels.includes(l.name));
+    const labelsToAdd = caseData.labelFiles.filter(l => !activeLabels.has(l.name));
 
-    const newActive = [...activeLabels];
-    for (const label of labelsToAdd) {
-      await nv.loadFromFile(label.file);
-      const vol = nv.volumes[nv.volumes.length - 1];
-      vol.name = label.name;
-      const originalIndex = caseData.labelFiles.findIndex(l => l.name === label.name);
-      applyColormap(vol, label.name, originalIndex);
-      vol.opacity = getLabelOpacity(label.name);
-      vol.cal_min = 0;
-      vol.cal_max = 1;
-      newActive.push(label.name);
+    if (labelsToAdd.length === 0) {
+      setIsLoadingLabels(false);
+      return;
     }
-    setActiveLabels(newActive);
-    setSoloLabel(null);
-    nv.updateGLVolume();
-    setIsLoadingLabels(false);
-  };
 
-  const hideAllLabels = () => {
-    if (!nv) return;
-    const volsToRemove = nv.volumes.filter(v => v.name && v.name !== '_base_');
-    volsToRemove.forEach(v => nv.removeVolume(v));
-    setActiveLabels([]);
-    setSoloLabel(null);
+    setLoadProgress({ loaded: 0, total: labelsToAdd.length });
+
+    // Phase 1: Parallel file loading in batches of 10 using NVImage.loadFromFile (static, no GPU side effects)
+    const BATCH_SIZE = 10;
+    const loadedImages: { nvImage: NVImage; label: LabelData }[] = [];
+    for (let i = 0; i < labelsToAdd.length; i += BATCH_SIZE) {
+      const batch = labelsToAdd.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async (label) => {
+          const nvImage = await NVImage.loadFromFile({ file: label.file, name: label.name });
+          return { nvImage, label };
+        })
+      );
+      loadedImages.push(...results);
+      setLoadProgress({ loaded: loadedImages.length, total: labelsToAdd.length });
+    }
+
+    // Phase 2: Push all loaded volumes to nv.volumes array and apply colormaps/opacity
+    for (const { nvImage, label } of loadedImages) {
+      nv.volumes.push(nvImage);
+      const originalIndex = caseData.labelFiles.findIndex(l => l.name === label.name);
+      applyColormap(nvImage, label.name, originalIndex);
+      nvImage.opacity = getLabelOpacity(label.name);
+      nvImage.cal_min = 0;
+      nvImage.cal_max = 1;
+    }
+
+    // Phase 3: Sync overlays and do a single GPU rebuild
+    nv.overlays = nv.volumes.slice(1);
     nv.updateGLVolume();
-  };
+
+    setActiveLabels(new Set(caseData.labelFiles.map(l => l.name)));
+    setSoloLabel(null);
+    setLoadProgress(null);
+    setIsLoadingLabels(false);
+  }, [nv, selectedCaseId, cases, activeLabels, getLabelOpacity]);
+
+  const hideAllLabels = useCallback(() => {
+    if (!nv) return;
+    const baseVol = nv.volumes.find(v => v.name === '_base_');
+    nv.volumes = baseVol ? [baseVol] : [];
+    nv.back = nv.volumes[0] ?? null;
+    nv.overlays = [];
+    nv.updateGLVolume();
+    setActiveLabels(new Set());
+    setSoloLabel(null);
+  }, [nv]);
 
   // Global opacity change — resets per-label overrides
-  const handleOpacityChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleOpacityChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseFloat(e.target.value);
     setLabelOpacity(val);
     setLabelOpacities({});
@@ -445,23 +568,23 @@ export default function App() {
           v.opacity = soloLabel ? (v.name === soloLabel ? val : 0) : val;
         }
       });
-      nv.updateGLVolume();
+      debouncedUpdateGLVolume();
     }
-  };
+  }, [nv, soloLabel, debouncedUpdateGLVolume]);
 
   // Per-label opacity change
-  const handleLabelOpacityChange = (labelName: string, val: number) => {
+  const handleLabelOpacityChange = useCallback((labelName: string, val: number) => {
     setLabelOpacities(prev => ({ ...prev, [labelName]: val }));
     if (!nv) return;
     const vol = nv.volumes.find(v => v.name === labelName);
     if (vol) {
       vol.opacity = soloLabel && soloLabel !== labelName ? 0 : val;
-      nv.updateGLVolume();
+      debouncedUpdateGLVolume();
     }
-  };
+  }, [nv, soloLabel, debouncedUpdateGLVolume]);
 
   // Color picker change
-  const handleLabelColorChange = (labelName: string, hexColor: string) => {
+  const handleLabelColorChange = useCallback((labelName: string, hexColor: string) => {
     setLabelColors(prev => ({ ...prev, [labelName]: hexColor }));
     if (!nv) return;
     const vol = nv.volumes.find(v => v.name === labelName);
@@ -470,12 +593,12 @@ export default function App() {
       const cmapName = `custom_${labelName}`;
       nv.addColormap(cmapName, { R: [0, r], G: [0, g], B: [0, b], A: [0, 255], I: [0, 255] });
       nv.setColormap(vol.id, cmapName);
-      nv.updateGLVolume();
+      debouncedUpdateGLVolume();
     }
-  };
+  }, [nv, debouncedUpdateGLVolume]);
 
   // Solo/Isolate toggle
-  const toggleSolo = (labelName: string) => {
+  const toggleSolo = useCallback((labelName: string) => {
     if (!nv) return;
     if (soloLabel === labelName) {
       // Un-solo: restore all opacities
@@ -495,7 +618,7 @@ export default function App() {
       });
     }
     nv.updateGLVolume();
-  };
+  }, [nv, soloLabel, getLabelOpacity]);
 
   const handleBgColorChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const val = e.target.value;
@@ -540,18 +663,26 @@ export default function App() {
 
   // Derive filtered labels
   const currentCase = selectedCaseId ? cases[selectedCaseId] : null;
-  const filteredLabels = currentCase
+  const filteredLabels = useMemo(() => currentCase
     ? currentCase.labelFiles.filter(l => l.name.toLowerCase().includes(labelSearchQuery.toLowerCase()))
-    : [];
+    : [], [currentCase, labelSearchQuery]);
+
+  // Build label index map for O(1) lookups (replaces findIndex calls)
+  const labelIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    if (currentCase) {
+      currentCase.labelFiles.forEach((l, i) => map.set(l.name, i));
+    }
+    return map;
+  }, [currentCase]);
 
   // Get display color for a label (custom or default)
-  const getDisplayColor = (labelName: string): string => {
+  const getDisplayColor = useCallback((labelName: string): string => {
     if (labelColors[labelName]) return labelColors[labelName];
-    if (!currentCase) return '#ff0000';
-    const idx = currentCase.labelFiles.findIndex(l => l.name === labelName);
+    const idx = labelIndexMap.get(labelName) ?? 0;
     const cmapName = DEFAULT_COLORMAPS[idx % DEFAULT_COLORMAPS.length];
     return COLOR_NAME_TO_HEX[cmapName] || cmapName;
-  };
+  }, [labelColors, labelIndexMap]);
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-300 font-sans overflow-hidden">
@@ -926,7 +1057,7 @@ export default function App() {
               <h2 className="text-sm font-semibold text-zinc-100 flex items-center justify-between">
                 <span className="flex items-center gap-2">
                   Segmentations
-                  {isLoadingLabels && <span className="text-xs text-indigo-400 animate-pulse">Loading...</span>}
+                  {isLoadingLabels && <span className="text-xs text-indigo-400 animate-pulse">{loadProgress ? `Loading ${loadProgress.loaded}/${loadProgress.total}...` : 'Loading...'}</span>}
                 </span>
                 <button
                   onClick={() => setIsRightSidebarCollapsed(true)}
@@ -968,72 +1099,27 @@ export default function App() {
             <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
               {filteredLabels.map((label) => {
                 const displayColor = getDisplayColor(label.name);
-                const isActive = activeLabels.includes(label.name);
+                const isActive = activeLabels.has(label.name);
                 const isSoloed = soloLabel === label.name;
-                const originalIndex = currentCase!.labelFiles.findIndex(l => l.name === label.name);
-                const defaultHex = COLOR_NAME_TO_HEX[DEFAULT_COLORMAPS[originalIndex % DEFAULT_COLORMAPS.length]] || '#ff0000';
+                const idx = labelIndexMap.get(label.name) ?? 0;
+                const defaultHex = COLOR_NAME_TO_HEX[DEFAULT_COLORMAPS[idx % DEFAULT_COLORMAPS.length]] || '#ff0000';
 
                 return (
-                  <div key={label.name} className={`rounded-md transition-colors ${isActive ? 'bg-zinc-800' : 'hover:bg-zinc-800/50'} ${isLoadingLabels ? 'opacity-50 pointer-events-none' : ''}`}>
-                    <div className="flex items-center gap-2 px-3 py-2">
-                      {/* Checkbox */}
-                      <label className="cursor-pointer shrink-0">
-                        <input
-                          type="checkbox"
-                          className="hidden"
-                          checked={isActive}
-                          onChange={(e) => toggleLabel(label.name, e.target.checked)}
-                        />
-                        <div className={`w-4 h-4 rounded flex items-center justify-center border ${isActive ? 'border-transparent' : 'border-zinc-600'}`} style={{ backgroundColor: isActive ? displayColor : 'transparent' }}>
-                          {isActive && <CheckSquare className="w-3 h-3 text-white" />}
-                        </div>
-                      </label>
-
-                      {/* Color picker (shows as swatch, click opens native picker) */}
-                      <div className="relative shrink-0">
-                        <input
-                          type="color"
-                          value={labelColors[label.name] || defaultHex}
-                          onChange={(e) => handleLabelColorChange(label.name, e.target.value)}
-                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                          title="Change color"
-                        />
-                        <div className="w-3.5 h-3.5 rounded-sm border border-zinc-600" style={{ backgroundColor: displayColor }}></div>
-                      </div>
-
-                      {/* Label name */}
-                      <span className={`text-xs font-medium truncate flex-1 ${isActive ? 'text-zinc-200' : 'text-zinc-500'}`} title={label.name}>
-                        {label.name}
-                      </span>
-
-                      {/* Solo button (only when active) */}
-                      {isActive && (
-                        <button
-                          onClick={() => toggleSolo(label.name)}
-                          className={`p-0.5 rounded transition-colors shrink-0 ${isSoloed ? 'text-indigo-300' : 'text-zinc-500 hover:text-zinc-300'}`}
-                          title={isSoloed ? 'Show all' : 'Solo this label'}
-                        >
-                          {isSoloed ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Per-label opacity slider (only when active) */}
-                    {isActive && (
-                      <div className="flex items-center gap-2 px-3 pb-2">
-                        <input
-                          type="range"
-                          min="0.05" max="1" step="0.05"
-                          value={labelOpacities[label.name] ?? labelOpacity}
-                          onChange={(e) => handleLabelOpacityChange(label.name, parseFloat(e.target.value))}
-                          className="flex-1 accent-indigo-500 h-1"
-                        />
-                        <span className="text-[10px] text-zinc-500 w-7 text-right tabular-nums">
-                          {Math.round((labelOpacities[label.name] ?? labelOpacity) * 100)}%
-                        </span>
-                      </div>
-                    )}
-                  </div>
+                  <LabelRow
+                    key={label.name}
+                    label={label}
+                    isActive={isActive}
+                    isSoloed={isSoloed}
+                    isLoadingLabels={isLoadingLabels}
+                    displayColor={displayColor}
+                    defaultHex={defaultHex}
+                    currentColor={labelColors[label.name] || ''}
+                    opacity={labelOpacities[label.name] ?? labelOpacity}
+                    onToggle={toggleLabel}
+                    onColorChange={handleLabelColorChange}
+                    onToggleSolo={toggleSolo}
+                    onOpacityChange={handleLabelOpacityChange}
+                  />
                 );
               })}
             </div>
