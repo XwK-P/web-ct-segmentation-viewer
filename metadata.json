@@ -1,0 +1,5 @@
+{
+  "name": "Web CT & Segmentation Viewer",
+  "description": "A web-based CT and multi-segmentation viewer using Niivue. Load NIfTI images and segmentations from local folders, adjust window/level, and view in 3D.",
+  "requestFramePermissions": []
+}
