@@ -17,6 +17,17 @@ type CaseData = {
   labelFiles: LabelData[];
 };
 
+type MergeLayer = {
+  mergedArray: Uint8Array;
+  labelIndices: Map<string, number>; // labelName -> 1-based index within this layer
+};
+
+type MergedLayerState = {
+  nvImages: NVImage[];
+  layerMap: Map<string, { layerIndex: number; labelIndex: number }>;
+  layers: MergeLayer[];
+};
+
 const DEFAULT_COLORMAPS = ['red', 'green', 'blue', 'yellow', 'cyan', 'magenta', 'orange'];
 
 const COLOR_NAME_TO_HEX: Record<string, string> = {
@@ -40,6 +51,84 @@ const DATATYPE_NAMES: Record<number, string> = {
   2: 'uint8', 4: 'int16', 8: 'int32', 16: 'float32', 64: 'float64',
   256: 'int8', 512: 'uint16', 768: 'uint32',
 };
+
+// --- Memory optimization: merge non-overlapping labels into indexed layers ---
+
+function downcastToUint8(nvImage: NVImage): void {
+  const img = (nvImage as any).img;
+  if (img && !(img instanceof Uint8Array)) {
+    let max = 0;
+    for (let i = 0; i < img.length; i++) {
+      if (img[i] > max) max = img[i];
+    }
+    if (max <= 255) {
+      (nvImage as any).img = new Uint8Array(img);
+      const hdr = nvImage.hdr as any;
+      if (hdr) {
+        hdr.datatypeCode = 2; // DT_UINT8
+        hdr.numBitsPerVoxel = 8;
+      }
+    }
+  }
+}
+
+function canPlaceInLayer(mergedArray: Uint8Array, labelImg: ArrayLike<number>, nVoxels: number): boolean {
+  const len = Math.min(nVoxels, labelImg.length);
+  for (let v = 0; v < len; v++) {
+    if (labelImg[v] > 0 && mergedArray[v] > 0) return false;
+  }
+  return true;
+}
+
+function buildLayerLUT(
+  layer: MergeLayer,
+  activeLabels: Set<string>,
+  labelColors: Record<string, string>,
+  labelOpacities: Record<string, number>,
+  globalOpacity: number,
+  soloLabel: string | null,
+  labelIndexMap: Map<string, number>,
+): { lut: Uint8ClampedArray; min: number; max: number; labels: string[] } {
+  const maxIndex = layer.labelIndices.size;
+  const lutSize = (maxIndex + 1) * 4; // RGBA per entry
+  const lut = new Uint8ClampedArray(lutSize);
+  const labels: string[] = new Array(maxIndex + 1).fill('');
+
+  // Index 0 = background = transparent (already zeros)
+  layer.labelIndices.forEach((idx, labelName) => {
+    const offset = idx * 4;
+    labels[idx] = labelName;
+
+    // Determine color
+    let r = 255, g = 0, b = 0;
+    if (labelColors[labelName]) {
+      [r, g, b] = hexToRgb(labelColors[labelName]);
+    } else {
+      const originalIndex = labelIndexMap.get(labelName) ?? 0;
+      const cmapName = DEFAULT_COLORMAPS[originalIndex % DEFAULT_COLORMAPS.length];
+      const hex = COLOR_NAME_TO_HEX[cmapName] || '#ff0000';
+      [r, g, b] = hexToRgb(hex);
+    }
+
+    // Determine alpha
+    let alpha = 0;
+    if (activeLabels.has(labelName)) {
+      if (soloLabel && soloLabel !== labelName) {
+        alpha = 0;
+      } else {
+        const opacity = labelOpacities[labelName] ?? globalOpacity;
+        alpha = Math.round(opacity * 255);
+      }
+    }
+
+    lut[offset] = r;
+    lut[offset + 1] = g;
+    lut[offset + 2] = b;
+    lut[offset + 3] = alpha;
+  });
+
+  return { lut, min: 0, max: maxIndex, labels };
+}
 
 type LabelRowProps = {
   label: LabelData;
@@ -169,6 +258,10 @@ export default function App() {
   // Phase 2: Solo/Isolate
   const [soloLabel, setSoloLabel] = useState<string | null>(null);
 
+  // Memory optimization: merged layers ref (not state — only used by control functions)
+  const mergedLayersRef = useRef<MergedLayerState | null>(null);
+  const mergeGenerationRef = useRef(0); // cancellation token for concurrent case loads
+
   // Phase 3: Clipping planes
   const [clipPlaneEnabled, setClipPlaneEnabled] = useState(false);
   const [clipPlaneDepth, setClipPlaneDepth] = useState(0.5);
@@ -177,24 +270,6 @@ export default function App() {
 
   // Phase 3: Metadata display
   const [isMetadataOpen, setIsMetadataOpen] = useState(false);
-
-  // Helper: get effective opacity for a label
-  const getLabelOpacity = useCallback((name: string) => {
-    return labelOpacities[name] ?? labelOpacity;
-  }, [labelOpacities, labelOpacity]);
-
-  // RAF-debounced GPU update for slider interactions
-  const updateGLVolumeTimerRef = useRef<number | null>(null);
-  const debouncedUpdateGLVolume = useCallback(() => {
-    if (!nv) return;
-    if (updateGLVolumeTimerRef.current !== null) {
-      cancelAnimationFrame(updateGLVolumeTimerRef.current);
-    }
-    updateGLVolumeTimerRef.current = requestAnimationFrame(() => {
-      nv.updateGLVolume();
-      updateGLVolumeTimerRef.current = null;
-    });
-  }, [nv]);
 
   // Initialize Niivue
   useEffect(() => {
@@ -397,6 +472,43 @@ export default function App() {
     });
   };
 
+  // Derive current case and label index map early (needed by rebuildAndApplyLUTs and below)
+  const currentCase = selectedCaseId ? cases[selectedCaseId] : null;
+  const labelIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    if (currentCase) {
+      currentCase.labelFiles.forEach((l, i) => map.set(l.name, i));
+    }
+    return map;
+  }, [currentCase]);
+
+  // Rebuild all layer LUTs and update GPU. Accepts overrides for state values
+  // that haven't settled yet (React state updates are async).
+  const rebuildAndApplyLUTs = useCallback((overrides: {
+    activeLabels?: Set<string>;
+    labelColors?: Record<string, string>;
+    labelOpacities?: Record<string, number>;
+    globalOpacity?: number;
+    soloLabel?: string | null;
+  } = {}) => {
+    const ml = mergedLayersRef.current;
+    if (!ml || !nv) return;
+
+    const effActive = overrides.activeLabels ?? activeLabels;
+    const effColors = overrides.labelColors ?? labelColors;
+    const effOpacities = overrides.labelOpacities ?? labelOpacities;
+    const effGlobalOpacity = overrides.globalOpacity ?? labelOpacity;
+    const effSolo = overrides.soloLabel !== undefined ? overrides.soloLabel : soloLabel;
+
+    for (let i = 0; i < ml.layers.length; i++) {
+      ml.nvImages[i].colormapLabel = buildLayerLUT(
+        ml.layers[i], effActive, effColors, effOpacities,
+        effGlobalOpacity, effSolo, labelIndexMap,
+      );
+    }
+    nv.updateGLVolume();
+  }, [nv, activeLabels, labelColors, labelOpacities, labelOpacity, soloLabel, labelIndexMap]);
+
   const loadCase = async (caseId: string) => {
     if (!nv) return;
     const caseData = cases[caseId];
@@ -411,6 +523,7 @@ export default function App() {
     setLabelColors({});
     setSoloLabel(null);
     setClipPlaneEnabled(false);
+    mergedLayersRef.current = null;
 
     // Clear existing volumes
     while (nv.volumes.length > 0) {
@@ -446,179 +559,183 @@ export default function App() {
       nv.setVolumeRenderIllumination(gradientAmount);
 
       nv.updateGLVolume();
+
+      // Merge labels into indexed layers for memory optimization
+      if (caseData.labelFiles.length > 0 && nv.volumes.length > 0) {
+        setIsLoadingLabels(true);
+        setLoadProgress({ loaded: 0, total: caseData.labelFiles.length });
+        const thisGeneration = ++mergeGenerationRef.current;
+
+        const baseVol = nv.volumes[0];
+        const hdr = baseVol.hdr as any;
+        const nVoxels = hdr.dims[1] * hdr.dims[2] * hdr.dims[3];
+        const dims = [hdr.dims[1], hdr.dims[2], hdr.dims[3]];
+        const pixDims = [hdr.pixDims[1], hdr.pixDims[2], hdr.pixDims[3]];
+        const affine = hdr.affine ? (hdr.affine as number[][]).flat() : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+
+        // Build a local labelIndexMap (state version may not have settled yet)
+        const localLabelIndexMap = new Map<string, number>();
+        caseData.labelFiles.forEach((l, i) => localLabelIndexMap.set(l.name, i));
+
+        const layers: MergeLayer[] = [];
+        const layerMap = new Map<string, { layerIndex: number; labelIndex: number }>();
+
+        // Process labels one at a time (limits peak memory to ~1 extra volume)
+        for (let i = 0; i < caseData.labelFiles.length; i++) {
+          if (mergeGenerationRef.current !== thisGeneration) break; // cancelled
+          const labelData = caseData.labelFiles[i];
+          try {
+            const tempImage = await NVImage.loadFromFile({ file: labelData.file, name: labelData.name });
+            downcastToUint8(tempImage);
+            const img = (tempImage as any).img as ArrayLike<number>;
+
+            // Greedy bin-pack: find first layer without conflict
+            let placed = false;
+            for (let li = 0; li < layers.length; li++) {
+              if (layers[li].labelIndices.size < 255 && canPlaceInLayer(layers[li].mergedArray, img, nVoxels)) {
+                const newIndex = layers[li].labelIndices.size + 1;
+                layers[li].labelIndices.set(labelData.name, newIndex);
+                for (let v = 0; v < Math.min(nVoxels, img.length); v++) {
+                  if (img[v] > 0) layers[li].mergedArray[v] = newIndex;
+                }
+                layerMap.set(labelData.name, { layerIndex: li, labelIndex: newIndex });
+                placed = true;
+                break;
+              }
+            }
+
+            if (!placed) {
+              // Create new layer
+              const newLayer: MergeLayer = {
+                mergedArray: new Uint8Array(nVoxels),
+                labelIndices: new Map(),
+              };
+              newLayer.labelIndices.set(labelData.name, 1);
+              for (let v = 0; v < Math.min(nVoxels, img.length); v++) {
+                if (img[v] > 0) newLayer.mergedArray[v] = 1;
+              }
+              layerMap.set(labelData.name, { layerIndex: layers.length, labelIndex: 1 });
+              layers.push(newLayer);
+            }
+          } catch (err) {
+            console.warn(`Failed to load label ${labelData.name}:`, err);
+          }
+
+          setLoadProgress({ loaded: i + 1, total: caseData.labelFiles.length });
+          // Yield to UI thread periodically
+          if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+        }
+
+        if (mergeGenerationRef.current !== thisGeneration) return; // cancelled
+
+        if (layers.length > 20) {
+          console.warn(`High layer count (${layers.length}): labels have extensive overlap. Memory savings may be limited.`);
+        }
+
+        // Convert merged layers to NVImages with LUT colormaps
+        const layerNVImages: NVImage[] = [];
+        for (let i = 0; i < layers.length; i++) {
+          const layer = layers[i];
+          const niftiBytes = NVImage.createNiftiArray(dims, pixDims, affine, 2, layer.mergedArray);
+          // Create a File to go through NVImage's proper NIfTI parser
+          const file = new File([niftiBytes], `_layer_${i}_.nii`);
+          const nvImg = await NVImage.loadFromFile({ file, name: `_layer_${i}_` });
+
+          // Set intent_code for atlas/label shader
+          (nvImg.hdr as any).intent_code = 1002;
+
+          // Build LUT with all labels inactive (empty activeLabels)
+          nvImg.colormapLabel = buildLayerLUT(
+            layer, new Set(), {}, {}, labelOpacity, null, localLabelIndexMap,
+          );
+          nvImg.opacity = 1; // Layer opacity is always 1; per-label alpha is in the LUT
+
+          layerNVImages.push(nvImg);
+          nv.volumes.push(nvImg);
+
+          // Free the mergedArray from the layer — NVImage now owns the voxel data
+          layer.mergedArray = new Uint8Array(0);
+        }
+
+        nv.overlays = nv.volumes.slice(1);
+        nv.updateGLVolume();
+
+        mergedLayersRef.current = { nvImages: layerNVImages, layerMap, layers };
+        console.log(`Merged ${caseData.labelFiles.length} labels into ${layers.length} layers`);
+
+        setIsLoadingLabels(false);
+        setLoadProgress(null);
+      }
     } catch (error) {
       console.error("Error loading files:", error);
       alert("Failed to load files. Check console for details.");
-    }
-  };
-
-  // Apply colormap to a volume (handles custom colors)
-  const applyColormap = (vol: any, labelName: string, originalIndex: number) => {
-    if (!nv) return;
-    if (labelColors[labelName]) {
-      const [r, g, b] = hexToRgb(labelColors[labelName]);
-      const cmapName = `custom_${labelName}`;
-      nv.addColormap(cmapName, { R: [0, r], G: [0, g], B: [0, b], A: [0, 255], I: [0, 255] });
-      nv.setColormap(vol.id, cmapName);
-    } else {
-      nv.setColormap(vol.id, DEFAULT_COLORMAPS[originalIndex % DEFAULT_COLORMAPS.length]);
-    }
-  };
-
-  const toggleLabel = useCallback(async (labelName: string, isChecked: boolean) => {
-    if (!nv || !selectedCaseId) return;
-    const caseData = cases[selectedCaseId];
-    setIsLoadingLabels(true);
-
-    if (isChecked) {
-      setActiveLabels(prev => new Set([...prev, labelName]));
-      const labelData = caseData.labelFiles.find(l => l.name === labelName);
-      if (labelData) {
-        await nv.loadFromFile(labelData.file);
-        const vol = nv.volumes[nv.volumes.length - 1];
-        vol.name = labelName;
-        const originalIndex = caseData.labelFiles.findIndex(l => l.name === labelName);
-        applyColormap(vol, labelName, originalIndex);
-        // Use per-label opacity if set, otherwise global; handle solo
-        const effectiveOpacity = soloLabel && soloLabel !== labelName ? 0 : getLabelOpacity(labelName);
-        vol.opacity = effectiveOpacity;
-        vol.cal_min = 0;
-        vol.cal_max = 1;
-        nv.updateGLVolume();
-      }
-    } else {
-      setActiveLabels(prev => { const next = new Set(prev); next.delete(labelName); return next; });
-      if (soloLabel === labelName) setSoloLabel(null);
-      const volToRemove = nv.volumes.find(v => v.name === labelName);
-      if (volToRemove) {
-        nv.removeVolume(volToRemove);
-        nv.updateGLVolume();
-      }
-    }
-    setIsLoadingLabels(false);
-  }, [nv, selectedCaseId, cases, soloLabel, getLabelOpacity]);
-
-  const showAllLabels = useCallback(async () => {
-    if (!nv || !selectedCaseId) return;
-    setIsLoadingLabels(true);
-    const caseData = cases[selectedCaseId];
-    const labelsToAdd = caseData.labelFiles.filter(l => !activeLabels.has(l.name));
-
-    if (labelsToAdd.length === 0) {
       setIsLoadingLabels(false);
-      return;
+      setLoadProgress(null);
     }
+  };
 
-    setLoadProgress({ loaded: 0, total: labelsToAdd.length });
-
-    // Phase 1: Parallel file loading in batches of 10 using NVImage.loadFromFile (static, no GPU side effects)
-    const BATCH_SIZE = 10;
-    const loadedImages: { nvImage: NVImage; label: LabelData }[] = [];
-    for (let i = 0; i < labelsToAdd.length; i += BATCH_SIZE) {
-      const batch = labelsToAdd.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(
-        batch.map(async (label) => {
-          const nvImage = await NVImage.loadFromFile({ file: label.file, name: label.name });
-          return { nvImage, label };
-        })
-      );
-      loadedImages.push(...results);
-      setLoadProgress({ loaded: loadedImages.length, total: labelsToAdd.length });
+  const toggleLabel = useCallback((labelName: string, isChecked: boolean) => {
+    if (!nv || !selectedCaseId) return;
+    if (isChecked) {
+      const newActive = new Set([...activeLabels, labelName]);
+      setActiveLabels(newActive);
+      rebuildAndApplyLUTs({ activeLabels: newActive });
+    } else {
+      const newActive = new Set(activeLabels);
+      newActive.delete(labelName);
+      setActiveLabels(newActive);
+      const newSolo = soloLabel === labelName ? null : soloLabel;
+      if (soloLabel === labelName) setSoloLabel(null);
+      rebuildAndApplyLUTs({ activeLabels: newActive, soloLabel: newSolo });
     }
+  }, [nv, selectedCaseId, activeLabels, soloLabel, rebuildAndApplyLUTs]);
 
-    // Phase 2: Push all loaded volumes to nv.volumes array and apply colormaps/opacity
-    for (const { nvImage, label } of loadedImages) {
-      nv.volumes.push(nvImage);
-      const originalIndex = caseData.labelFiles.findIndex(l => l.name === label.name);
-      applyColormap(nvImage, label.name, originalIndex);
-      nvImage.opacity = getLabelOpacity(label.name);
-      nvImage.cal_min = 0;
-      nvImage.cal_max = 1;
-    }
-
-    // Phase 3: Sync overlays and do a single GPU rebuild
-    nv.overlays = nv.volumes.slice(1);
-    nv.updateGLVolume();
-
-    setActiveLabels(new Set(caseData.labelFiles.map(l => l.name)));
+  const showAllLabels = useCallback(() => {
+    if (!nv || !selectedCaseId) return;
+    const caseData = cases[selectedCaseId];
+    const allLabels = new Set(caseData.labelFiles.map(l => l.name));
+    setActiveLabels(allLabels);
     setSoloLabel(null);
-    setLoadProgress(null);
-    setIsLoadingLabels(false);
-  }, [nv, selectedCaseId, cases, activeLabels, getLabelOpacity]);
+    rebuildAndApplyLUTs({ activeLabels: allLabels, soloLabel: null });
+  }, [nv, selectedCaseId, cases, rebuildAndApplyLUTs]);
 
   const hideAllLabels = useCallback(() => {
     if (!nv) return;
-    const baseVol = nv.volumes.find(v => v.name === '_base_');
-    nv.volumes = baseVol ? [baseVol] : [];
-    nv.back = nv.volumes[0] ?? null;
-    nv.overlays = [];
-    nv.updateGLVolume();
-    setActiveLabels(new Set());
+    const empty = new Set<string>();
+    setActiveLabels(empty);
     setSoloLabel(null);
-  }, [nv]);
+    rebuildAndApplyLUTs({ activeLabels: empty, soloLabel: null });
+  }, [nv, rebuildAndApplyLUTs]);
 
   // Global opacity change — resets per-label overrides
   const handleOpacityChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseFloat(e.target.value);
     setLabelOpacity(val);
     setLabelOpacities({});
-    if (nv) {
-      nv.volumes.forEach(v => {
-        if (v.name && v.name !== '_base_') {
-          v.opacity = soloLabel ? (v.name === soloLabel ? val : 0) : val;
-        }
-      });
-      debouncedUpdateGLVolume();
-    }
-  }, [nv, soloLabel, debouncedUpdateGLVolume]);
+    rebuildAndApplyLUTs({ globalOpacity: val, labelOpacities: {} });
+  }, [rebuildAndApplyLUTs]);
 
   // Per-label opacity change
   const handleLabelOpacityChange = useCallback((labelName: string, val: number) => {
-    setLabelOpacities(prev => ({ ...prev, [labelName]: val }));
-    if (!nv) return;
-    const vol = nv.volumes.find(v => v.name === labelName);
-    if (vol) {
-      vol.opacity = soloLabel && soloLabel !== labelName ? 0 : val;
-      debouncedUpdateGLVolume();
-    }
-  }, [nv, soloLabel, debouncedUpdateGLVolume]);
+    const newOpacities = { ...labelOpacities, [labelName]: val };
+    setLabelOpacities(newOpacities);
+    rebuildAndApplyLUTs({ labelOpacities: newOpacities });
+  }, [labelOpacities, rebuildAndApplyLUTs]);
 
   // Color picker change
   const handleLabelColorChange = useCallback((labelName: string, hexColor: string) => {
-    setLabelColors(prev => ({ ...prev, [labelName]: hexColor }));
-    if (!nv) return;
-    const vol = nv.volumes.find(v => v.name === labelName);
-    if (vol) {
-      const [r, g, b] = hexToRgb(hexColor);
-      const cmapName = `custom_${labelName}`;
-      nv.addColormap(cmapName, { R: [0, r], G: [0, g], B: [0, b], A: [0, 255], I: [0, 255] });
-      nv.setColormap(vol.id, cmapName);
-      debouncedUpdateGLVolume();
-    }
-  }, [nv, debouncedUpdateGLVolume]);
+    const newColors = { ...labelColors, [labelName]: hexColor };
+    setLabelColors(newColors);
+    rebuildAndApplyLUTs({ labelColors: newColors });
+  }, [labelColors, rebuildAndApplyLUTs]);
 
   // Solo/Isolate toggle
   const toggleSolo = useCallback((labelName: string) => {
     if (!nv) return;
-    if (soloLabel === labelName) {
-      // Un-solo: restore all opacities
-      setSoloLabel(null);
-      nv.volumes.forEach(v => {
-        if (v.name && v.name !== '_base_') {
-          v.opacity = getLabelOpacity(v.name);
-        }
-      });
-    } else {
-      // Solo this label
-      setSoloLabel(labelName);
-      nv.volumes.forEach(v => {
-        if (v.name && v.name !== '_base_') {
-          v.opacity = v.name === labelName ? getLabelOpacity(v.name) : 0;
-        }
-      });
-    }
-    nv.updateGLVolume();
-  }, [nv, soloLabel, getLabelOpacity]);
+    const newSolo = soloLabel === labelName ? null : labelName;
+    setSoloLabel(newSolo);
+    rebuildAndApplyLUTs({ soloLabel: newSolo });
+  }, [nv, soloLabel, rebuildAndApplyLUTs]);
 
   const handleBgColorChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const val = e.target.value;
@@ -662,19 +779,9 @@ export default function App() {
   };
 
   // Derive filtered labels
-  const currentCase = selectedCaseId ? cases[selectedCaseId] : null;
   const filteredLabels = useMemo(() => currentCase
     ? currentCase.labelFiles.filter(l => l.name.toLowerCase().includes(labelSearchQuery.toLowerCase()))
     : [], [currentCase, labelSearchQuery]);
-
-  // Build label index map for O(1) lookups (replaces findIndex calls)
-  const labelIndexMap = useMemo(() => {
-    const map = new Map<string, number>();
-    if (currentCase) {
-      currentCase.labelFiles.forEach((l, i) => map.set(l.name, i));
-    }
-    return map;
-  }, [currentCase]);
 
   // Get display color for a label (custom or default)
   const getDisplayColor = useCallback((labelName: string): string => {
@@ -1057,7 +1164,7 @@ export default function App() {
               <h2 className="text-sm font-semibold text-zinc-100 flex items-center justify-between">
                 <span className="flex items-center gap-2">
                   Segmentations
-                  {isLoadingLabels && <span className="text-xs text-indigo-400 animate-pulse">{loadProgress ? `Loading ${loadProgress.loaded}/${loadProgress.total}...` : 'Loading...'}</span>}
+                  {isLoadingLabels && <span className="text-xs text-indigo-400 animate-pulse">{loadProgress ? `Merging ${loadProgress.loaded}/${loadProgress.total}...` : 'Loading...'}</span>}
                 </span>
                 <button
                   onClick={() => setIsRightSidebarCollapsed(true)}
