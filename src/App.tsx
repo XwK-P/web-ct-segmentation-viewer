@@ -336,6 +336,7 @@ export default function App() {
   const hideCTVolumeRef = useRef(false);
   const [labelMergingEnabled, setLabelMergingEnabled] = useState(false);
   const loadedLabelsRef = useRef<Map<string, NVImage>>(new Map()); // for non-merged on-demand loading
+  const colorDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Phase 3: Clipping planes
   const [clipPlaneEnabled, setClipPlaneEnabled] = useState(false);
@@ -956,15 +957,18 @@ export default function App() {
     }
   }, [labelOpacities, labelMergingEnabled, rebuildAndApplyLUTs, refreshIndividualLabels]);
 
-  // Color picker change
+  // Color picker change — update state immediately for responsive UI, debounce expensive GL work
   const handleLabelColorChange = useCallback((labelName: string, hexColor: string) => {
     const newColors = { ...labelColors, [labelName]: hexColor };
     setLabelColors(newColors);
-    if (labelMergingEnabled) {
-      rebuildAndApplyLUTs({ labelColors: newColors });
-    } else {
-      refreshIndividualLabels({ labelColors: newColors });
-    }
+    if (colorDebounceRef.current) clearTimeout(colorDebounceRef.current);
+    colorDebounceRef.current = setTimeout(() => {
+      if (labelMergingEnabled) {
+        rebuildAndApplyLUTs({ labelColors: newColors });
+      } else {
+        refreshIndividualLabels({ labelColors: newColors });
+      }
+    }, 250);
   }, [labelColors, labelMergingEnabled, rebuildAndApplyLUTs, refreshIndividualLabels]);
 
   // Solo/Isolate toggle
