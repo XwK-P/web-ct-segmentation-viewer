@@ -72,6 +72,56 @@ function downcastToUint8(nvImage: NVImage): void {
   }
 }
 
+async function loadNiftiVoxels(file: File, nVoxels: number): Promise<Uint8Array> {
+  let buffer: ArrayBuffer;
+  if (file.name.endsWith('.gz')) {
+    const compressed = await file.arrayBuffer();
+    const ds = new DecompressionStream('gzip');
+    const writer = ds.writable.getWriter();
+    writer.write(new Uint8Array(compressed));
+    writer.close();
+    buffer = await new Response(ds.readable).arrayBuffer();
+  } else {
+    buffer = await file.arrayBuffer();
+  }
+
+  const view = new DataView(buffer);
+  const sizeof_hdr = view.getInt32(0, true);
+  const littleEndian = sizeof_hdr === 348;
+  const datatype = view.getInt16(70, littleEndian);
+  const vox_offset = Math.round(view.getFloat32(108, littleEndian));
+
+  if (datatype === 2) { // DT_UINT8
+    return new Uint8Array(buffer, vox_offset, nVoxels);
+  } else if (datatype === 4 || datatype === 512) { // DT_INT16, DT_UINT16
+    const bytesPerEl = 2;
+    let src: Int16Array | Uint16Array;
+    if (vox_offset % bytesPerEl !== 0) {
+      const aligned = new ArrayBuffer(nVoxels * bytesPerEl);
+      new Uint8Array(aligned).set(new Uint8Array(buffer, vox_offset, nVoxels * bytesPerEl));
+      src = datatype === 4 ? new Int16Array(aligned) : new Uint16Array(aligned);
+    } else {
+      src = datatype === 4 ? new Int16Array(buffer, vox_offset, nVoxels) : new Uint16Array(buffer, vox_offset, nVoxels);
+    }
+    const dst = new Uint8Array(nVoxels);
+    for (let i = 0; i < nVoxels; i++) if (src[i] > 0) dst[i] = Math.min(255, src[i]);
+    return dst;
+  } else if (datatype === 16) { // DT_FLOAT32
+    let src: Float32Array;
+    if (vox_offset % 4 !== 0) {
+      const aligned = new ArrayBuffer(nVoxels * 4);
+      new Uint8Array(aligned).set(new Uint8Array(buffer, vox_offset, nVoxels * 4));
+      src = new Float32Array(aligned);
+    } else {
+      src = new Float32Array(buffer, vox_offset, nVoxels);
+    }
+    const dst = new Uint8Array(nVoxels);
+    for (let i = 0; i < nVoxels; i++) if (src[i] > 0) dst[i] = Math.min(255, Math.round(src[i]));
+    return dst;
+  }
+  return new Uint8Array(buffer, vox_offset, nVoxels);
+}
+
 function canPlaceInLayer(mergedArray: Uint8Array, labelImg: ArrayLike<number>, nVoxels: number): boolean {
   const len = Math.min(nVoxels, labelImg.length);
   for (let v = 0; v < len; v++) {
@@ -579,51 +629,71 @@ export default function App() {
 
         const layers: MergeLayer[] = [];
         const layerMap = new Map<string, { layerIndex: number; labelIndex: number }>();
+        const mergeStart = performance.now();
 
-        // Process labels one at a time (limits peak memory to ~1 extra volume)
-        for (let i = 0; i < caseData.labelFiles.length; i++) {
-          if (mergeGenerationRef.current !== thisGeneration) break; // cancelled
-          const labelData = caseData.labelFiles[i];
-          try {
-            const tempImage = await NVImage.loadFromFile({ file: labelData.file, name: labelData.name });
-            downcastToUint8(tempImage);
-            const img = (tempImage as any).img as ArrayLike<number>;
+        const BATCH_SIZE = 8;
+        const useNativeDecompress = typeof DecompressionStream !== 'undefined';
 
-            // Greedy bin-pack: find first layer without conflict
+        for (let batchStart = 0; batchStart < caseData.labelFiles.length; batchStart += BATCH_SIZE) {
+          if (mergeGenerationRef.current !== thisGeneration) break;
+
+          const batchEnd = Math.min(batchStart + BATCH_SIZE, caseData.labelFiles.length);
+          const batch = caseData.labelFiles.slice(batchStart, batchEnd);
+
+          // Phase A: Parallel decompression + parsing
+          let batchResults: { name: string; img: Uint8Array }[];
+
+          if (useNativeDecompress) {
+            batchResults = await Promise.all(
+              batch.map(async (labelData) => ({
+                name: labelData.name,
+                img: await loadNiftiVoxels(labelData.file, nVoxels),
+              }))
+            );
+          } else {
+            // Fallback: sequential NVImage.loadFromFile
+            batchResults = [];
+            for (const labelData of batch) {
+              try {
+                const tempImage = await NVImage.loadFromFile({ file: labelData.file, name: labelData.name });
+                downcastToUint8(tempImage);
+                batchResults.push({ name: labelData.name, img: (tempImage as any).img as Uint8Array });
+              } catch (err) { console.warn(`Failed to load label ${labelData.name}:`, err); }
+            }
+          }
+
+          // Phase B: Sequential greedy bin-pack
+          for (const { name, img } of batchResults) {
             let placed = false;
             for (let li = 0; li < layers.length; li++) {
               if (layers[li].labelIndices.size < 255 && canPlaceInLayer(layers[li].mergedArray, img, nVoxels)) {
                 const newIndex = layers[li].labelIndices.size + 1;
-                layers[li].labelIndices.set(labelData.name, newIndex);
+                layers[li].labelIndices.set(name, newIndex);
                 for (let v = 0; v < Math.min(nVoxels, img.length); v++) {
                   if (img[v] > 0) layers[li].mergedArray[v] = newIndex;
                 }
-                layerMap.set(labelData.name, { layerIndex: li, labelIndex: newIndex });
+                layerMap.set(name, { layerIndex: li, labelIndex: newIndex });
                 placed = true;
                 break;
               }
             }
 
             if (!placed) {
-              // Create new layer
               const newLayer: MergeLayer = {
                 mergedArray: new Uint8Array(nVoxels),
                 labelIndices: new Map(),
               };
-              newLayer.labelIndices.set(labelData.name, 1);
+              newLayer.labelIndices.set(name, 1);
               for (let v = 0; v < Math.min(nVoxels, img.length); v++) {
                 if (img[v] > 0) newLayer.mergedArray[v] = 1;
               }
-              layerMap.set(labelData.name, { layerIndex: layers.length, labelIndex: 1 });
+              layerMap.set(name, { layerIndex: layers.length, labelIndex: 1 });
               layers.push(newLayer);
             }
-          } catch (err) {
-            console.warn(`Failed to load label ${labelData.name}:`, err);
           }
 
-          setLoadProgress({ loaded: i + 1, total: caseData.labelFiles.length });
-          // Yield to UI thread periodically
-          if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+          setLoadProgress({ loaded: batchEnd, total: caseData.labelFiles.length });
+          await new Promise(r => setTimeout(r, 0));
         }
 
         if (mergeGenerationRef.current !== thisGeneration) return; // cancelled
@@ -640,9 +710,6 @@ export default function App() {
           // Create a File to go through NVImage's proper NIfTI parser
           const file = new File([niftiBytes], `_layer_${i}_.nii`);
           const nvImg = await NVImage.loadFromFile({ file, name: `_layer_${i}_` });
-
-          // Set intent_code for atlas/label shader
-          (nvImg.hdr as any).intent_code = 1002;
 
           // Build LUT with all labels inactive (empty activeLabels)
           nvImg.colormapLabel = buildLayerLUT(
@@ -661,7 +728,7 @@ export default function App() {
         nv.updateGLVolume();
 
         mergedLayersRef.current = { nvImages: layerNVImages, layerMap, layers };
-        console.log(`Merged ${caseData.labelFiles.length} labels into ${layers.length} layers`);
+        console.log(`Merged ${caseData.labelFiles.length} labels into ${layers.length} layers in ${((performance.now() - mergeStart) / 1000).toFixed(1)}s`);
 
         setIsLoadingLabels(false);
         setLoadProgress(null);
