@@ -640,14 +640,8 @@ export default function App() {
         if (nv.volumes.length > 0) {
           const vol = nv.volumes[0];
           vol.name = '_base_';
-          // Ensure cal_min/cal_max are set for proper 3D rendering
-          if (vol.robust_min !== undefined && vol.robust_max !== undefined
-            && vol.robust_min !== vol.robust_max) {
-            vol.cal_min = vol.robust_min;
-            vol.cal_max = vol.robust_max;
-          }
-          setWindowMin(Math.round(vol.cal_min ?? 0));
-          setWindowMax(Math.round(vol.cal_max ?? 0));
+          // Set default window level to -1000, 150 (lung window) for CT images
+          setWindowLevel(-1000, 150);
         }
       }
 
@@ -670,7 +664,7 @@ export default function App() {
         const nVoxels = hdr.dims[1] * hdr.dims[2] * hdr.dims[3];
         const dims = [hdr.dims[1], hdr.dims[2], hdr.dims[3]];
         const pixDims = [hdr.pixDims[1], hdr.pixDims[2], hdr.pixDims[3]];
-        const affine = hdr.affine ? (hdr.affine as number[][]).flat() : [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+        const affine = hdr.affine ? (hdr.affine as number[][]).flat() : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
         // Build a local labelIndexMap (state version may not have settled yet)
         const localLabelIndexMap = new Map<string, number>();
@@ -841,7 +835,7 @@ export default function App() {
       }
     }
   }, [nv, selectedCaseId, activeLabels, soloLabel, labelMergingEnabled, cases,
-      labelColors, labelOpacities, labelOpacity, labelIndexMap, rebuildAndApplyLUTs]);
+    labelColors, labelOpacities, labelOpacity, labelIndexMap, rebuildAndApplyLUTs]);
 
   const showAllLabels = useCallback(async () => {
     if (!nv || !selectedCaseId) return;
@@ -880,7 +874,7 @@ export default function App() {
       refreshIndividualLabels({ soloLabel: null });
     }
   }, [nv, selectedCaseId, cases, labelMergingEnabled, labelColors, labelOpacities,
-      labelOpacity, labelIndexMap, rebuildAndApplyLUTs, refreshIndividualLabels]);
+    labelOpacity, labelIndexMap, rebuildAndApplyLUTs, refreshIndividualLabels]);
 
   const hideAllLabels = useCallback(() => {
     if (!nv) return;
@@ -1226,7 +1220,7 @@ export default function App() {
                 <label className="flex items-center gap-1.5 flex-1">
                   <span className="text-xs text-zinc-500 w-10">Depth</span>
                   <input
-                    type="range" min="0" max="1.73" step="0.01"
+                    type="range" min="-0.5" max="0.5" step="0.01"
                     value={clipPlaneDepth}
                     onChange={(e) => setClipPlaneDepth(parseFloat(e.target.value))}
                     className="flex-1 accent-indigo-500"
@@ -1267,7 +1261,7 @@ export default function App() {
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1.5">
                 <span className="text-xs font-medium text-zinc-500">W/L:</span>
-                <button onClick={() => setWindowLevel(-1000, 1000)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Lung</button>
+                <button onClick={() => setWindowLevel(-1000, 150)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Lung</button>
                 <button onClick={() => setWindowLevel(-150, 250)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Soft Tissue</button>
                 <button onClick={() => setWindowLevel(100, 500)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Bone</button>
                 <button onClick={() => setWindowLevel(0, 80)} className="px-2 py-1 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">Brain</button>
