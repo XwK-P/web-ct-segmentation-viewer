@@ -303,6 +303,9 @@ export default function App() {
   // Current slice type for view-aware mouse config
   const [sliceType, setSliceType] = useState(3); // default multiplanar
 
+  // Hide CT base volume in 3D view (show only segmentations)
+  const [hideCTVolume, setHideCTVolume] = useState(false);
+
   // Window/Level live values
   const [windowMin, setWindowMin] = useState(0);
   const [windowMax, setWindowMax] = useState(0);
@@ -328,7 +331,9 @@ export default function App() {
 
   // Memory optimization: merged layers ref (not state — only used by control functions)
   const mergedLayersRef = useRef<MergedLayerState | null>(null);
-  const mergeGenerationRef = useRef(0); // cancellation token for concurrent case loads
+  const loadCaseGenerationRef = useRef(0); // cancellation token for concurrent loadCase calls
+  const loadCaseLockRef = useRef(false); // prevents concurrent loadCase execution
+  const hideCTVolumeRef = useRef(false);
   const [labelMergingEnabled, setLabelMergingEnabled] = useState(false);
   const loadedLabelsRef = useRef<Map<string, NVImage>>(new Map()); // for non-merged on-demand loading
 
@@ -439,6 +444,33 @@ export default function App() {
       nv.setClipPlane([2.1, 0, 0]); // depth > 2.0 disables
     }
   }, [nv, clipPlaneEnabled, clipPlaneDepth, clipPlaneAzimuth, clipPlaneElevation, sliceType]);
+
+  // Hide/show CT base volume in 3D rendering only (keep 2D slices visible)
+  // Monkey-patch updateGLVolume to override the render shader's backOpacity uniform
+  // after each update, so 3D rendering hides the CT while 2D slices remain unaffected.
+  hideCTVolumeRef.current = hideCTVolume;
+  useEffect(() => {
+    if (!nv) return;
+    const nvAny = nv as any;
+    const originalUpdateGLVolume = nv.updateGLVolume.bind(nv);
+    nv.updateGLVolume = () => {
+      originalUpdateGLVolume();
+      if (hideCTVolumeRef.current && nv.volumes[0]?.name === '_base_' && nvAny.renderShader) {
+        nvAny.gl.useProgram(nvAny.renderShader.program);
+        nvAny.gl.uniform1f(nvAny.renderShader.uniforms.backOpacity, 0);
+        nv.drawScene();
+      }
+    };
+    return () => {
+      nv.updateGLVolume = originalUpdateGLVolume;
+    };
+  }, [nv]);
+
+  // Trigger redraw when hideCTVolume changes
+  useEffect(() => {
+    if (!nv || nv.volumes.length === 0) return;
+    nv.updateGLVolume();
+  }, [nv, hideCTVolume]);
 
   // Zoom helpers
   const zoomIn = useCallback(() => {
@@ -611,6 +643,12 @@ export default function App() {
     if (!nv) return;
     const caseData = cases[caseId];
     if (!caseData) return;
+    if (loadCaseLockRef.current) return; // prevent concurrent loads
+
+    loadCaseLockRef.current = true;
+
+    // Cancel any in-flight merge work
+    const thisGeneration = ++loadCaseGenerationRef.current;
 
     setSelectedCaseId(caseId);
     setActiveLabels(new Set()); // Default to visualize none
@@ -634,7 +672,7 @@ export default function App() {
     nv.updateGLVolume();
 
     try {
-      // Load image first
+      // Load image
       if (caseData.imageFile) {
         await nv.loadFromFile(caseData.imageFile);
         if (nv.volumes.length > 0) {
@@ -657,7 +695,6 @@ export default function App() {
       if (labelMergingEnabled && caseData.labelFiles.length > 0 && nv.volumes.length > 0) {
         setIsLoadingLabels(true);
         setLoadProgress({ loaded: 0, total: caseData.labelFiles.length });
-        const thisGeneration = ++mergeGenerationRef.current;
 
         const baseVol = nv.volumes[0];
         const hdr = baseVol.hdr as any;
@@ -678,7 +715,7 @@ export default function App() {
         const useNativeDecompress = typeof DecompressionStream !== 'undefined';
 
         for (let batchStart = 0; batchStart < caseData.labelFiles.length; batchStart += BATCH_SIZE) {
-          if (mergeGenerationRef.current !== thisGeneration) break;
+          if (loadCaseGenerationRef.current !== thisGeneration) break;
 
           const batchEnd = Math.min(batchStart + BATCH_SIZE, caseData.labelFiles.length);
           const batch = caseData.labelFiles.slice(batchStart, batchEnd);
@@ -739,7 +776,7 @@ export default function App() {
           await new Promise(r => setTimeout(r, 0));
         }
 
-        if (mergeGenerationRef.current !== thisGeneration) return; // cancelled
+        if (loadCaseGenerationRef.current !== thisGeneration) return; // cancelled
 
         if (layers.length > 20) {
           console.warn(`High layer count (${layers.length}): labels have extensive overlap. Memory savings may be limited.`);
@@ -781,6 +818,8 @@ export default function App() {
       alert("Failed to load files. Check console for details.");
       setIsLoadingLabels(false);
       setLoadProgress(null);
+    } finally {
+      loadCaseLockRef.current = false;
     }
   };
 
@@ -1172,6 +1211,17 @@ export default function App() {
               </button>
 
               <div className="w-px h-6 bg-zinc-800 mx-1"></div>
+
+              {/* Hide CT volume toggle (3D & Multiplanar) */}
+              {(sliceType === 3 || sliceType === 4) && (
+                <button
+                  onClick={() => setHideCTVolume(!hideCTVolume)}
+                  className={`p-1.5 rounded transition-colors ${hideCTVolume ? 'text-indigo-300 bg-indigo-500/20' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'}`}
+                  title={hideCTVolume ? 'Show CT volume' : 'Hide CT volume (show segmentations only)'}
+                >
+                  {hideCTVolume ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              )}
 
               {/* Clip plane toggle (3D only) */}
               {sliceType === 4 && (
