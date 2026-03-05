@@ -40,11 +40,18 @@ const COLOR_NAME_TO_HEX: Record<string, string> = {
   orange: '#ffa500',
 };
 
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 10;
+
 function hexToRgb(hex: string): [number, number, number] {
   const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
   return result
     ? [parseInt(result[1], 16), parseInt(result[2], 16), parseInt(result[3], 16)]
     : [255, 0, 0];
+}
+
+function clampZoom(zoom: number): number {
+  return Math.min(Math.max(zoom, MIN_ZOOM), MAX_ZOOM);
 }
 
 const DATATYPE_NAMES: Record<number, string> = {
@@ -414,6 +421,32 @@ export default function App() {
   }, [nv, sliceType]);
 
   // Ctrl+scroll zoom for 2D views only (not 3D)
+  const setViewerZoom = useCallback((nextZoom: number, resetPan = false) => {
+    if (!nv) return;
+    const clampedZoom = clampZoom(nextZoom);
+
+    if (sliceType === 4) {
+      nv.setScale(clampedZoom);
+      return;
+    }
+
+    if (resetPan) {
+      nv.setPan2Dxyzmm([0, 0, 0, clampedZoom] as any);
+      return;
+    }
+
+    const currentPan = nv.scene.pan2Dxyzmm;
+    const zoomChange = currentPan[3] - clampedZoom;
+    const mm = nv.frac2mm(nv.scene.crosshairPos);
+
+    nv.setPan2Dxyzmm([
+      currentPan[0] + zoomChange * mm[0],
+      currentPan[1] + zoomChange * mm[1],
+      currentPan[2] + zoomChange * mm[2],
+      clampedZoom,
+    ] as any);
+  }, [nv, sliceType]);
+
   useEffect(() => {
     if (!nv) return;
     const canvas = canvasRef.current;
@@ -426,15 +459,14 @@ export default function App() {
       e.preventDefault();
       e.stopPropagation();
       const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-      nv.volScaleMultiplier = Math.min(Math.max(nv.volScaleMultiplier * factor, 0.2), 10);
-      nv.drawScene();
+      setViewerZoom(nv.scene.pan2Dxyzmm[3] * factor);
     };
 
     canvas.addEventListener('wheel', handleWheel, { passive: false, capture: true });
     return () => {
       canvas.removeEventListener('wheel', handleWheel, { capture: true });
     };
-  }, [nv, sliceType]);
+  }, [nv, sliceType, setViewerZoom]);
 
   // Clip plane effect
   useEffect(() => {
@@ -476,21 +508,20 @@ export default function App() {
   // Zoom helpers
   const zoomIn = useCallback(() => {
     if (!nv) return;
-    nv.volScaleMultiplier = Math.min(nv.volScaleMultiplier * 1.2, 10);
-    nv.drawScene();
-  }, [nv]);
+    const currentZoom = sliceType === 4 ? nv.volScaleMultiplier : nv.scene.pan2Dxyzmm[3];
+    setViewerZoom(currentZoom * 1.2);
+  }, [nv, sliceType, setViewerZoom]);
 
   const zoomOut = useCallback(() => {
     if (!nv) return;
-    nv.volScaleMultiplier = Math.max(nv.volScaleMultiplier / 1.2, 0.2);
-    nv.drawScene();
-  }, [nv]);
+    const currentZoom = sliceType === 4 ? nv.volScaleMultiplier : nv.scene.pan2Dxyzmm[3];
+    setViewerZoom(currentZoom / 1.2);
+  }, [nv, sliceType, setViewerZoom]);
 
   const zoomReset = useCallback(() => {
     if (!nv) return;
-    nv.volScaleMultiplier = 1;
-    nv.drawScene();
-  }, [nv]);
+    setViewerZoom(1, true);
+  }, [nv, setViewerZoom]);
 
   // Screenshot
   const takeScreenshot = useCallback(() => {
@@ -670,6 +701,8 @@ export default function App() {
     while (nv.meshes.length > 0) {
       nv.removeMesh(nv.meshes[0]);
     }
+    nv.scene.pan2Dxyzmm = [0, 0, 0, 1] as any;
+    nv.scene.volScaleMultiplier = 1;
     nv.updateGLVolume();
 
     try {
